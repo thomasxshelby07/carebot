@@ -1,7 +1,6 @@
 import os
 import logging
 import time
-import re
 from dotenv import load_dotenv
 import telebot
 from telebot.types import (
@@ -21,16 +20,22 @@ ADMIN_ID = int(ADMIN_ID)
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # State Storage
-# user_sessions : {user_id: {"username": str, "msg_count": int, "open": bool}}
-# pending_requests : {user_id: {"username": str, "time": float}}
+#
+# user_sessions   : {user_id: {"username": str, "msg_count": int}}
+# pending_requests: {user_id: {"username": str, "time": float}}
+# msg_map         : {admin_msg_id: user_id}   ← KEY FIX: reliable reply routing
 # ─────────────────────────────────────────────
-user_sessions = {}
+user_sessions    = {}
 pending_requests = {}
+msg_map          = {}   # Maps every forwarded admin message → original user_id
 
 
 # ─────────────────────────────────────────────
@@ -66,6 +71,19 @@ def build_followup_header(username, user_id, count):
     )
 
 
+def send_to_admin_and_map(user_id, send_fn, *args, **kwargs):
+    """
+    Calls send_fn(*args, **kwargs) to send a message to admin,
+    then registers the resulting message_id → user_id in msg_map.
+    Returns the sent Message object.
+    """
+    sent = send_fn(*args, **kwargs)
+    if sent:
+        msg_map[sent.message_id] = user_id
+        logger.info(f"msg_map updated: admin_msg_id={sent.message_id} → user_id={user_id}")
+    return sent
+
+
 # ─────────────────────────────────────────────
 # /start
 # ─────────────────────────────────────────────
@@ -80,17 +98,17 @@ def send_welcome(message):
             bot.send_message(
                 ADMIN_ID,
                 "👋 <b>Admin Panel — dafaxbet.com Support</b>\n\n"
-                "• <b>Reply</b> to any user message to respond\n"
+                "• <b>Reply</b> to any forwarded user message to respond\n"
                 "• Press <b>✅ Mark as Resolved</b> to close a ticket\n"
                 "• Use <b>📋 Pending Tickets</b> to see open cases",
                 reply_markup=markup
             )
             return
 
+        # Reset / init session for user
         user_sessions[user_id] = {
             "username": get_username(message.from_user),
-            "msg_count": 0,
-            "open": True
+            "msg_count": 0
         }
 
         bot.send_message(
@@ -123,7 +141,7 @@ def show_pending_tickets(message):
                 f"{i}. {data['username']}  ·  <code>{uid}</code>\n"
                 f"   ⏱ {mins_ago} min ago\n"
             )
-        lines.append("<i>Reply to their message in chat to respond.</i>")
+        lines.append("<i>Reply to a forwarded message in chat to respond.</i>")
         bot.send_message(ADMIN_ID, "\n".join(lines))
     except Exception as e:
         logger.error(f"Pending tickets error: {e}")
@@ -133,16 +151,19 @@ def show_pending_tickets(message):
 # USER → ADMIN: Forward messages
 # ─────────────────────────────────────────────
 @bot.message_handler(
-    content_types=['text', 'photo'],
+    content_types=['text', 'photo', 'document', 'video', 'voice', 'audio', 'sticker'],
     func=lambda m: m.chat.id != ADMIN_ID
 )
 def handle_user_message(message):
     try:
         user_id = message.from_user.id
 
+        # Auto-register if user messages without /start
         if user_id not in user_sessions:
-            bot.send_message(message.chat.id, "Please send /start to begin.")
-            return
+            user_sessions[user_id] = {
+                "username": get_username(message.from_user),
+                "msg_count": 0
+            }
 
         session = user_sessions[user_id]
         session["msg_count"] += 1
@@ -157,29 +178,101 @@ def handle_user_message(message):
 
         markup = make_resolve_markup(user_id)
 
-        # First message → full card, follow-ups → compact header
+        # Build header
         if count == 1:
             header = build_first_message_header(username, user_id)
         else:
             header = build_followup_header(username, user_id, count)
 
+        # ── Forward to admin and register in msg_map ──
         if message.content_type == 'text':
             full_msg = f"{header}{message.text}"
-            bot.send_message(ADMIN_ID, full_msg, reply_markup=markup if count == 1 else None)
+            send_to_admin_and_map(
+                user_id,
+                bot.send_message,
+                ADMIN_ID, full_msg, reply_markup=markup
+            )
 
         elif message.content_type == 'photo':
             caption_text = message.caption or ""
             full_caption = f"{header}{caption_text}"
             if len(full_caption) > 1024:
                 full_caption = full_caption[:1020] + "…"
-            bot.send_photo(
+            send_to_admin_and_map(
+                user_id,
+                bot.send_photo,
                 ADMIN_ID,
                 message.photo[-1].file_id,
                 caption=full_caption,
-                reply_markup=markup if count == 1 else None
+                reply_markup=markup
             )
 
-        # Subtle ack to user (no spam)
+        elif message.content_type == 'document':
+            caption_text = message.caption or ""
+            full_caption = f"{header}{caption_text}"[:1024]
+            send_to_admin_and_map(
+                user_id,
+                bot.send_document,
+                ADMIN_ID,
+                message.document.file_id,
+                caption=full_caption,
+                reply_markup=markup
+            )
+
+        elif message.content_type == 'video':
+            caption_text = message.caption or ""
+            full_caption = f"{header}{caption_text}"[:1024]
+            send_to_admin_and_map(
+                user_id,
+                bot.send_video,
+                ADMIN_ID,
+                message.video.file_id,
+                caption=full_caption,
+                reply_markup=markup
+            )
+
+        elif message.content_type == 'voice':
+            send_to_admin_and_map(
+                user_id,
+                bot.send_voice,
+                ADMIN_ID,
+                message.voice.file_id,
+                caption=header,
+                reply_markup=markup
+            )
+
+        elif message.content_type == 'audio':
+            send_to_admin_and_map(
+                user_id,
+                bot.send_audio,
+                ADMIN_ID,
+                message.audio.file_id,
+                caption=header,
+                reply_markup=markup
+            )
+
+        elif message.content_type == 'sticker':
+            # Send header as text first, then sticker
+            header_msg = bot.send_message(ADMIN_ID, header, reply_markup=markup)
+            msg_map[header_msg.message_id] = user_id
+            send_to_admin_and_map(
+                user_id,
+                bot.send_sticker,
+                ADMIN_ID,
+                message.sticker.file_id
+            )
+
+        else:
+            # Unsupported type — forward generic notice
+            send_to_admin_and_map(
+                user_id,
+                bot.send_message,
+                ADMIN_ID,
+                f"{header}[Unsupported message type: {message.content_type}]",
+                reply_markup=markup
+            )
+
+        # ── Ack to user ──
         if count == 1:
             bot.send_message(
                 message.chat.id,
@@ -190,81 +283,83 @@ def handle_user_message(message):
             bot.send_message(message.chat.id, "📨 <i>Message added to your ticket.</i>")
 
     except Exception as e:
-        logger.error(f"User message error: {e}")
-        bot.send_message(message.chat.id, "⚠️ Something went wrong. Please try again.")
+        logger.error(f"User message error: {e}", exc_info=True)
+        try:
+            bot.send_message(message.chat.id, "⚠️ Something went wrong. Please try again.")
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
 # ADMIN → USER: Reply
 # ─────────────────────────────────────────────
 @bot.message_handler(
-    content_types=['text', 'photo'],
+    content_types=['text', 'photo', 'document', 'video', 'voice', 'audio'],
     func=lambda m: m.chat.id == ADMIN_ID and m.reply_to_message is not None
 )
 def handle_admin_reply(message):
     try:
-        reply_to = message.reply_to_message
+        reply_to_id = message.reply_to_message.message_id
 
-        # Parse text from replied message
-        if reply_to.content_type == 'text':
-            source_text = reply_to.text or ""
-        elif reply_to.content_type == 'photo':
-            source_text = reply_to.caption or ""
-        else:
-            source_text = ""
+        # ── Primary: look up from msg_map ──
+        target_user_id = msg_map.get(reply_to_id)
 
-        # Extract UserID
-        if "ID:</b>" not in source_text and "ID:</b" not in source_text:
-            # Try plain text fallback
-            if "UserID:" in source_text:
-                id_marker = "UserID:"
-            else:
-                bot.send_message(ADMIN_ID, "❌ <b>Can't find User ID</b> in that message.\nMake sure you're replying to a support ticket.")
-                return
-        else:
-            id_marker = "ID:</b>"
-
-        parts = source_text.split(id_marker)
-        if len(parts) < 2:
-            bot.send_message(ADMIN_ID, "❌ Could not parse User ID from that message.")
+        if not target_user_id:
+            bot.send_message(
+                ADMIN_ID,
+                "❌ <b>Can't find user for this message.</b>\n"
+                "Make sure you're replying to a <i>forwarded support message</i>.\n\n"
+                "<i>Tip: Only messages forwarded after the latest bot restart are mapped.</i>"
+            )
             return
 
-        raw_id = parts[1].split('\n')[0].strip()
-        clean_id = re.sub(r'<[^>]+>', '', raw_id).strip()
+        # Snapshot username before deleting from pending
+        username = pending_requests.get(target_user_id, {}).get("username", f"<code>{target_user_id}</code>")
 
-        if not clean_id.isdigit():
-            bot.send_message(ADMIN_ID, f"❌ Invalid user ID extracted: <code>{clean_id}</code>")
-            return
-
-        target_user_id = int(clean_id)
-
-        # Build reply to user
+        # ── Build reply ──
         reply_header = "🎧 <b>Support Team Reply:</b>\n\n"
-        reply_footer = "\n\n<i>— dafaxbet.com Support</i>"
+        reply_footer  = "\n\n<i>— dafaxbet.com Support</i>"
 
         if message.content_type == 'text':
-            bot.send_message(target_user_id, f"{reply_header}{message.text}{reply_footer}")
+            bot.send_message(
+                target_user_id,
+                f"{reply_header}{message.text}{reply_footer}"
+            )
 
         elif message.content_type == 'photo':
             cap = message.caption or ""
-            full_cap = f"{reply_header}{cap}{reply_footer}"
-            if len(full_cap) > 1024:
-                full_cap = full_cap[:1020] + "…"
+            full_cap = f"{reply_header}{cap}{reply_footer}"[:1024]
             bot.send_photo(target_user_id, message.photo[-1].file_id, caption=full_cap)
 
-        # Close ticket + clean up
+        elif message.content_type == 'document':
+            cap = message.caption or ""
+            full_cap = f"{reply_header}{cap}{reply_footer}"[:1024]
+            bot.send_document(target_user_id, message.document.file_id, caption=full_cap)
+
+        elif message.content_type == 'video':
+            cap = message.caption or ""
+            full_cap = f"{reply_header}{cap}{reply_footer}"[:1024]
+            bot.send_video(target_user_id, message.video.file_id, caption=full_cap)
+
+        elif message.content_type == 'voice':
+            bot.send_voice(target_user_id, message.voice.file_id)
+
+        elif message.content_type == 'audio':
+            bot.send_audio(target_user_id, message.audio.file_id)
+
+        # ── Clean up ticket ──
         if target_user_id in pending_requests:
             del pending_requests[target_user_id]
 
-        # Reset msg_count so next user message starts fresh thread
+        # Reset msg_count for fresh thread next time
         if target_user_id in user_sessions:
             user_sessions[target_user_id]["msg_count"] = 0
 
-        # Remove resolve button from original ticket card
+        # Remove resolve button from original ticket
         try:
             bot.edit_message_reply_markup(
                 chat_id=ADMIN_ID,
-                message_id=reply_to.message_id,
+                message_id=reply_to_id,
                 reply_markup=None
             )
         except Exception:
@@ -272,12 +367,11 @@ def handle_admin_reply(message):
 
         bot.send_message(
             ADMIN_ID,
-            f"✅ <b>Reply sent</b> to {pending_requests.get(target_user_id, {}).get('username', f'<code>{target_user_id}</code>')}.\n"
-            f"Ticket auto-closed."
+            f"✅ <b>Reply sent</b> to {username}.\nTicket auto-closed."
         )
 
     except Exception as e:
-        logger.error(f"Admin reply error: {e}")
+        logger.error(f"Admin reply error: {e}", exc_info=True)
         bot.send_message(ADMIN_ID, "❌ Failed to send reply. Check logs.")
 
 
@@ -297,7 +391,10 @@ def handle_resolve_ticket(call):
             del pending_requests[user_id]
             if user_id in user_sessions:
                 user_sessions[user_id]["msg_count"] = 0
+
             bot.answer_callback_query(call.id, "✅ Ticket resolved!")
+
+            # Remove inline button
             try:
                 bot.edit_message_reply_markup(
                     chat_id=call.message.chat.id,
@@ -306,10 +403,11 @@ def handle_resolve_ticket(call):
                 )
             except Exception:
                 pass
-            # Subtle inline edit to show resolved state
+
+            # Mark resolved visually
             try:
                 original_text = call.message.text or call.message.caption or ""
-                resolved_text = original_text + f"\n\n<i>✅ Resolved</i>"
+                resolved_text = original_text + "\n\n<i>✅ Resolved</i>"
                 if call.message.content_type == 'text':
                     bot.edit_message_text(
                         chat_id=ADMIN_ID,
@@ -317,9 +415,19 @@ def handle_resolve_ticket(call):
                         text=resolved_text,
                         parse_mode="HTML"
                     )
-                # For photos we skip text edit (caption limit)
             except Exception:
                 pass
+
+            # Notify user their ticket is closed
+            try:
+                bot.send_message(
+                    user_id,
+                    "✅ <b>Your support ticket has been marked as resolved.</b>\n"
+                    "<i>If you need further help, feel free to message us again.</i>"
+                )
+            except Exception:
+                pass
+
         else:
             bot.answer_callback_query(call.id, "⚠️ Already resolved.", show_alert=True)
             try:
@@ -332,17 +440,22 @@ def handle_resolve_ticket(call):
                 pass
 
     except Exception as e:
-        logger.error(f"Resolve error: {e}")
+        logger.error(f"Resolve error: {e}", exc_info=True)
 
 
 # ─────────────────────────────────────────────
 # Run
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    logger.info("Bot starting...")
+    logger.info("Bot starting — polling mode")
     while True:
         try:
-            bot.polling(non_stop=True, interval=0, timeout=20)
+            bot.polling(
+                non_stop=True,
+                interval=0,
+                timeout=30,
+                allowed_updates=["message", "callback_query"]
+            )
         except Exception as e:
-            logger.error(f"Polling error: {e}")
+            logger.error(f"Polling crashed: {e}", exc_info=True)
             time.sleep(5)
